@@ -1,0 +1,55 @@
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR....
+      - aws --version
+      - ecrvalue=$(aws ssm get-parameter --region $AWS_REGION --name "/tbenv/ecrqa" --with-decryption --query "Parameter.Value" --output text)
+      - echo '{$ecrvalue}'      
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ecrvalue
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}     
+      - echo "Writing environment variables to .env file..."       
+      - |
+        aws ssm get-parameters-by-path --region $AWS_REGION --path "/tb/qa" --with-decryption --query "Parameters[].{Name: Name, Value: Value}" --output json > parameters.json                
+      - echo "Formatting parameters and writing to .env file..."
+      - cat parameters.json | jq -r '.[] | "\(.Name[7:])=\(.Value)"' > .env
+      - |
+        aws secretsmanager --region $AWS_REGION get-secret-value --secret-id "TbqaRDSsecret" --query "SecretString" --output text > secrets.txt
+      - sed -i 's/"username"/"DB_USER"/g; s/"password"/"DB_PASSWORD"/g' secrets.txt
+      - jq -r 'to_entries[] | "\(.key) = \(.value)"' < secrets.txt >> .env
+      - cat .env                
+      - echo "Replacing node:18-alpine with public.ecr.aws/docker/library/node:18-alpine3.18 in Dockerfile..."
+      #- sed -i 's/node:18-alpine/public.ecr.aws\/m6m2k5b0\/node_18-alpine/g' Dockerfile
+      - sed -i 's/FROM node:18-alpine/FROM public.ecr.aws\/m6m2k5b0\/tb-api-base-node-chrome-18-alpine:latest/g' Dockerfile
+      - ecsenv=$(aws ssm get-parameter --region $AWS_REGION --name "/tb/qa/ENV" --with-decryption --query "Parameter.Value" --output text)
+      
+      
+      - lambdabucketname=$(aws ssm get-parameter --region $AWS_REGION --name "/tb/qa/lambdabucketname" --with-decryption --query "Parameter.Value" --output text)
+      - aws s3 cp s3://$lambdabucketname/directory-hash/hashes-old.json .
+      - aws s3 cp s3://$lambdabucketname/scripts/deploy-lambda-resources.sh .
+      - chmod +x deploy-lambda-resources.sh
+      - bash deploy-lambda-resources.sh
+      - rm hashes-old.json
+      - mv hashes.json hashes-old.json
+      - aws s3 cp hashes-old.json s3://$lambdabucketname/directory-hash/
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...
+      - docker build --build-arg NODE_ENV=$ecsenv -t $ecrvalue:latest .
+      - docker tag $ecrvalue:latest $ecrvalue:$IMAGE_TAG
+  post_build:
+    commands:
+      - echo running migrations
+      - docker run --entrypoint=npm $ecrvalue:latest run migration:run
+      - echo Build completed on `date`
+      - echo Pushing to repo
+      - docker push $ecrvalue:latest
+      - docker push $ecrvalue:$IMAGE_TAG
+      - echo Writing image definitions file...
+      - printf '{"ImageURI":"%s"}' $ecrvalue:$IMAGE_TAG > imageDetail.json      
+artifacts:
+  files:
+    - imageDetail.json
+    - .env
